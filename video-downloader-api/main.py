@@ -1,11 +1,11 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
 import uuid
 import os
-import threading
-import time
+import tempfile
 
 app = FastAPI(title="Video Downloader API")
 
@@ -16,94 +16,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Armazena o status dos jobs em memória
-jobs = {}
-
 class DownloadRequest(BaseModel):
     url: str
 
 class BatchDownloadRequest(BaseModel):
     urls: list[str]
 
-def get_video_info(url: str):
+def download_video_with_audio(url: str, output_dir: str) -> dict:
+    filename = str(uuid.uuid4())
+    output_template = os.path.join(output_dir, filename + ".%(ext)s")
+
     ydl_opts = {
+        "format": "bestvideo+bestaudio/best",
+        "outtmpl": output_template,
+        "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
-        "skip_download": True,
+        "postprocessors": [{
+            "key": "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }],
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return info
+        info = ydl.extract_info(url, download=True)
+        title = info.get("title", "video")
+        thumbnail = info.get("thumbnail", "")
+        platform = info.get("extractor", "")
+
+    for f in os.listdir(output_dir):
+        if f.startswith(filename):
+            return {
+                "filepath": os.path.join(output_dir, f),
+                "title": title,
+                "thumbnail": thumbnail,
+                "platform": platform,
+            }
+
+    raise Exception("Arquivo não encontrado após download")
 
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Video Downloader API is running"}
 
-@app.post("/info")
-def video_info(req: DownloadRequest):
-    """Retorna informações do vídeo sem baixar"""
+@app.post("/download")
+def download_single(req: DownloadRequest):
+    """Baixa um vídeo com áudio e retorna o arquivo MP4"""
+    tmp_dir = tempfile.mkdtemp()
     try:
-        info = get_video_info(req.url)
-        return {
-            "title": info.get("title"),
-            "thumbnail": info.get("thumbnail"),
-            "duration": info.get("duration"),
-            "platform": info.get("extractor"),
-        }
+        result = download_video_with_audio(req.url, tmp_dir)
+        return FileResponse(
+            path=result["filepath"],
+            media_type="video/mp4",
+            filename=result["title"][:50] + ".mp4",
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/download-link")
-def get_download_link(req: DownloadRequest):
-    """Retorna o link direto do MP4 sem baixar no servidor"""
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
-            
-            # Pega o melhor formato MP4
-            formats = info.get("formats", [])
-            best_url = None
-            best_quality = 0
-            
-            for f in formats:
-                if f.get("ext") == "mp4" and f.get("url"):
-                    height = f.get("height") or 0
-                    if height > best_quality:
-                        best_quality = height
-                        best_url = f.get("url")
-            
-            # Fallback para URL direta
-            if not best_url:
-                best_url = info.get("url")
-            
-            if not best_url:
-                raise HTTPException(status_code=404, detail="Não foi possível obter o link do vídeo")
-            
-            return {
-                "success": True,
-                "download_url": best_url,
-                "title": info.get("title"),
-                "thumbnail": info.get("thumbnail"),
-                "platform": info.get("extractor"),
-                "ext": "mp4",
-            }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/batch-links")
-def get_batch_download_links(req: BatchDownloadRequest):
-    """Retorna links diretos para múltiplos vídeos"""
+@app.post("/batch-info")
+def get_batch_info(req: BatchDownloadRequest):
+    """Retorna info dos vídeos"""
     if len(req.urls) > 20:
         raise HTTPException(status_code=400, detail="Máximo de 20 vídeos por vez")
-    
+
     results = []
     for url in req.urls:
         try:
@@ -111,32 +86,16 @@ def get_batch_download_links(req: BatchDownloadRequest):
                 "quiet": True,
                 "no_warnings": True,
                 "skip_download": True,
-                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                
-                formats = info.get("formats", [])
-                best_url = None
-                best_quality = 0
-                
-                for f in formats:
-                    if f.get("ext") == "mp4" and f.get("url"):
-                        height = f.get("height") or 0
-                        if height > best_quality:
-                            best_quality = height
-                            best_url = f.get("url")
-                
-                if not best_url:
-                    best_url = info.get("url")
-                
                 results.append({
                     "url": url,
                     "success": True,
-                    "download_url": best_url,
-                    "title": info.get("title"),
-                    "thumbnail": info.get("thumbnail"),
-                    "platform": info.get("extractor"),
+                    "original_url": url,
+                    "title": info.get("title", "Vídeo"),
+                    "thumbnail": info.get("thumbnail", ""),
+                    "platform": info.get("extractor", ""),
                 })
         except Exception as e:
             results.append({
@@ -144,5 +103,5 @@ def get_batch_download_links(req: BatchDownloadRequest):
                 "success": False,
                 "error": str(e),
             })
-    
+
     return {"results": results}
